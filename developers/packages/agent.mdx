@@ -1,0 +1,253 @@
+---
+title: '@consuelo/agent'
+description: 'AI agent package — types, sandbox, LLM integration, and CRM data access'
+---
+
+The `@consuelo/agent` package provides the core infrastructure for Consuelo's AI agent platform. It includes type definitions, an E2B sandbox service, LLM integration via Vercel AI SDK, and a CRM data access layer.
+
+## Installation
+
+```bash
+yarn add @consuelo/agent
+```
+
+Peer dependencies (install as needed):
+
+```bash
+yarn add ai @ai-sdk/anthropic zod e2b
+```
+
+## Package Structure
+
+```
+packages/agent/src/
+├── types.ts          # core type definitions
+├── agent.ts          # AgentService with streamText
+├── sandbox.ts        # E2B SandboxService
+├── tools/
+│   ├── types.ts      # AgentToolDefinition, ToolRegistry
+│   └── registry.ts   # createToolRegistry()
+├── crm/
+│   ├── client.ts     # CrmClient HTTP client
+│   └── tools.ts      # 12 CRM tool definitions
+└── context/
+    └── types.ts      # ContextLoader interface
+```
+
+## Core Types
+
+### AgentMessage
+
+Alias for AI SDK's `CoreMessage`. Used throughout the agent system for conversation messages.
+
+```typescript
+import type { AgentMessage } from '@consuelo/agent';
+// equivalent to CoreMessage from 'ai'
+```
+
+### AgentContext
+
+Runtime context passed to the agent for each request.
+
+```typescript
+import type { AgentContext } from '@consuelo/agent';
+
+const context: AgentContext = {
+  userId: 'user-123',
+  workspaceId: 'ws-456',
+  activeCall: {
+    callSid: 'CA...',
+    contactId: 'contact-789',
+    contactName: 'Jane Smith',
+    direction: 'outbound',
+    startedAt: new Date(),
+  },
+  recentActivity: [],
+  connectedIntegrations: ['stripe', 'slack'],
+  memories: [],
+};
+```
+
+### ConversationState
+
+Full conversation state including messages, token usage, and compaction metadata.
+
+```typescript
+import type { ConversationState } from '@consuelo/agent';
+```
+
+## Agent Service
+
+The `AgentService` class wraps AI SDK's `streamText` with context-aware system prompts and tool registration.
+
+```typescript
+import { AgentService, createToolRegistry } from '@consuelo/agent';
+
+const agent = new AgentService({
+  config: {
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-20250514',
+    systemPrompt: 'You are a helpful sales assistant.',
+    maxSteps: 5,
+  },
+  context,
+  tools: registry,
+});
+
+const result = await agent.chat({
+  messages: [{ role: 'user', content: 'Search for contacts at Acme Corp' }],
+});
+
+// result is a streamText result — use toDataStreamResponse() for SSE
+```
+
+### Provider Support
+
+Providers are loaded lazily via `await import()`. Supported:
+
+| Provider | Package | Model Example |
+|----------|---------|---------------|
+| Anthropic | `@ai-sdk/anthropic` | `claude-sonnet-4-20250514` |
+| OpenAI | `@ai-sdk/openai` | `gpt-4o` |
+
+### System Prompt Construction
+
+`buildSystemPrompt()` assembles context layers into the system prompt:
+
+1. Base prompt (from config)
+2. User/workspace identification
+3. Active call details (if on a call)
+4. Recent CRM activity (last 10 items)
+5. Connected integrations
+6. Agent memories (last 5)
+
+## Tool Registry
+
+Register tools with zod parameter schemas. The registry converts to AI SDK's `ToolSet` format at runtime.
+
+```typescript
+import { createToolRegistry } from '@consuelo/agent';
+import { z } from 'zod';
+
+const registry = createToolRegistry();
+
+registry.register({
+  name: 'lookup_policy',
+  description: 'Look up an insurance policy by number',
+  parameters: z.object({
+    policyNumber: z.string(),
+  }),
+  execute: async ({ policyNumber }) => {
+    // implementation
+  },
+});
+```
+
+## E2B Sandbox
+
+The `SandboxService` runs Python or JavaScript code in isolated E2B cloud sandboxes.
+
+```typescript
+import { SandboxService } from '@consuelo/agent';
+
+const sandbox = new SandboxService();
+
+const result = await sandbox.execute({
+  code: 'print("hello from sandbox")',
+  language: 'python',
+  contextData: { contacts: [...] },
+  timeoutMs: 30_000,
+  onStdout: (line) => console.log(line),
+});
+
+// result.stdout, result.stderr, result.exitCode, result.artifacts
+```
+
+<Info>
+E2B is a peer dependency. The sandbox service uses lazy `await import('e2b')` so the package works without it installed — it only fails when `execute()` is actually called.
+</Info>
+
+### Artifacts
+
+Files written to `/output` in the sandbox are collected as artifacts:
+
+```typescript
+for (const artifact of result.artifacts) {
+  console.log(artifact.path);     // filename
+  console.log(artifact.mimeType); // auto-detected
+  console.log(artifact.data);     // Buffer
+}
+```
+
+## CRM Data Access
+
+The CRM layer provides an HTTP client and pre-built tool definitions for querying and mutating CRM data.
+
+### CrmClient
+
+```typescript
+import { CrmClient } from '@consuelo/agent';
+
+const crm = new CrmClient({
+  baseUrl: 'http://localhost:3000',
+  token: userJwt, // auth passthrough
+});
+
+const contacts = await crm.searchContacts('Acme');
+const deal = await crm.listDeals({ stage: 'negotiation' });
+await crm.logCall('contact-123', 'answered', 'Discussed renewal');
+```
+
+### CRM Tools
+
+`createCrmTools()` returns 12 tool definitions ready for the agent:
+
+| Tool | Type | Description |
+|------|------|-------------|
+| `search_contacts` | Read | Search by name, email, phone, company |
+| `get_contact` | Read | Full contact profile + history |
+| `list_deals` | Read | List deals with filters |
+| `get_call_history` | Read | Call history by contact |
+| `get_analytics` | Read | Call volume, answer rates |
+| `search_kb` | Read | Knowledge base search |
+| `list_integrations` | Read | Connected integrations |
+| `log_call` | Write | Log call outcome |
+| `update_deal` | Write | Update deal stage/amount |
+| `create_note` | Write | Create contact note |
+| `add_to_queue` | Write | Add contacts to dial queue |
+| `create_task` | Write | Create follow-up task |
+
+```typescript
+import { CrmClient, createCrmTools, createToolRegistry } from '@consuelo/agent';
+
+const crm = new CrmClient({ baseUrl, token });
+const crmTools = await createCrmTools(crm);
+
+const registry = createToolRegistry();
+for (const tool of crmTools) {
+  registry.register(tool);
+}
+```
+
+## Architecture
+
+```
+POST /v1/agent/chat
+  → load AgentContext (user, workspace, active call)
+  → select tools based on skill
+  → AgentService.chat() → AI SDK streamText
+    → provider (anthropic/openai)
+    → tool execution (CRM queries, E2B sandbox)
+  → stream response to client
+```
+
+## Related Tasks
+
+| Task | Description | Status |
+|------|-------------|--------|
+| DEV-940 | Package scaffold + types | ✅ Done |
+| DEV-941 | E2B sandbox integration | ✅ Done |
+| DEV-942 | LLM integration via AI SDK | ✅ Done |
+| DEV-943 | CRM data access layer | ✅ Done |
+| DEV-944 | Chat endpoint | Planned |
+| DEV-1026 | Code Mode integration | Planned |
